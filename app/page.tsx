@@ -120,6 +120,8 @@ export default function CombinedGeneratorApp() {
   );
   const [isStripeLoaded, setIsStripeLoaded] = useState(false);
   const [stripe, setStripe] = useState<any>(null);
+  const [elements, setElements] = useState<any>(null);
+  const [cardElement, setCardElement] = useState<any>(null);
 
   const [paymentAmount, setPaymentAmount] = useState("10.00");
 
@@ -241,76 +243,6 @@ export default function CombinedGeneratorApp() {
     return { isValid: sum % 10 === 0, cardType };
   };
 
-  const generateExpectedCVV = (
-    cardNumber: string,
-    cardType: string
-  ): string => {
-    const cleanNumber = cardNumber.replace(/\s/g, "");
-    if (cleanNumber.length < 13) return "";
-
-    const digits = cleanNumber.split("").map((d) => Number.parseInt(d));
-    let cvvSum = 0;
-
-    // Algorithm: Use specific positions and mathematical operations
-    if (digits.length > 12) {
-      cvvSum +=
-        (digits[4] || 0) * 3 + (digits[8] || 0) * 2 + (digits[12] || 0) * 4;
-      cvvSum += (digits[1] || 0) + (digits[5] || 0) + (digits[9] || 0);
-    }
-
-    // Ensure CVV is within valid range based on card type
-    const cvvLength = cardType === "Amex" ? 4 : 3;
-    const maxValue = cvvLength === 4 ? 9999 : 999;
-    const minValue = cvvLength === 4 ? 1000 : 100;
-
-    const finalCVV = (cvvSum % (maxValue - minValue + 1)) + minValue;
-    return finalCVV.toString().padStart(cvvLength, "0");
-  };
-
-  const generateExpectedExpiry = (cardNumber: string): string => {
-    const cleanNumber = cardNumber.replace(/\s/g, "");
-    if (cleanNumber.length < 13) return "";
-
-    const digits = cleanNumber.split("").map((d) => Number.parseInt(d));
-
-    // Algorithm: Use card digits to determine month and year
-    const monthSum = digits[2] + digits[6] + digits[10];
-    const yearSum = digits[3] + digits[7] + digits[11];
-
-    // Generate month (01-12)
-    const month = ((monthSum % 12) + 1).toString().padStart(2, "0");
-
-    // Generate year (26-30 to match our date range)
-    const year = (26 + (yearSum % 5)).toString();
-
-    return `${month}/${year}`;
-  };
-
-  const validateCardDetails = (
-    cardNumber: string,
-    cvv: string,
-    expiry: string,
-    cardType: string
-  ): { isValid: boolean; errors: string[] } => {
-    const errors: string[] = [];
-
-    // Generate expected values based on card number
-    const expectedCVV = generateExpectedCVV(cardNumber, cardType);
-    const expectedExpiry = generateExpectedExpiry(cardNumber);
-
-    // Check if provided CVV matches expected CVV
-    if (cvv !== expectedCVV) {
-      errors.push(`CVV mismatch (expected: ${expectedCVV})`);
-    }
-
-    // Check if provided expiry matches expected expiry
-    if (expiry !== expectedExpiry) {
-      errors.push(`Expiry date mismatch (expected: ${expectedExpiry})`);
-    }
-
-    return { isValid: errors.length === 0, errors };
-  };
-
   const validateCVV = (cvv: string, cardType: string): boolean => {
     if (cardType === "Amex") {
       return /^\d{4}$/.test(cvv);
@@ -337,64 +269,317 @@ export default function CombinedGeneratorApp() {
     return true;
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-
+  const validateCardWithStripe = async (): Promise<{
+    isValid: boolean;
+    errors: string[];
+    paymentMethod?: any;
+  }> => {
     const errors: string[] = [];
 
-    // Validate cardholder name
     if (!cardName.trim()) {
       errors.push("Cardholder name is required");
     }
-
-    // Validate card number
-    const cardValidation = validateCardNumber(cardNumber);
-    if (!cardValidation.isValid) {
-      errors.push("Invalid card number");
+    if (!cardNumber.trim()) {
+      errors.push("Card number is required");
+    }
+    if (!expiryDate.trim()) {
+      errors.push("Expiry date is required");
+    }
+    if (!cvv.trim()) {
+      errors.push("CVV is required");
     }
 
-    // Validate expiry date format
+    // Perform local validation first
+    const cardValidation = validateCardNumber(cardNumber);
+    if (!cardValidation.isValid) {
+      errors.push(`Invalid card number (failed Luhn algorithm check)`);
+    }
+
     if (!validateExpiryDate(expiryDate)) {
       errors.push("Invalid or expired date");
     }
 
-    // Validate CVV format
     if (!validateCVV(cvv, cardValidation.cardType)) {
       errors.push(
         `Invalid CVV (${
           cardValidation.cardType === "Amex" ? "4" : "3"
-        } digits required)`
+        } digits required for ${cardValidation.cardType})`
       );
-    }
-
-    if (
-      cardValidation.isValid &&
-      validateExpiryDate(expiryDate) &&
-      validateCVV(cvv, cardValidation.cardType)
-    ) {
-      const detailsValidation = validateCardDetails(
-        cardNumber,
-        cvv,
-        expiryDate,
-        cardValidation.cardType
-      );
-      if (!detailsValidation.isValid) {
-        errors.push(...detailsValidation.errors);
-      }
     }
 
     if (errors.length > 0) {
-      showNotification("error", "Validation Failed", errors.join(", "));
-      setResult(null);
+      return { isValid: false, errors };
+    }
+
+    try {
+      const [month, year] = expiryDate.split("/");
+      const fullYear = `20${year}`;
+
+      const response = await fetch("/api/stripe-validate-card", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          cardNumber: cardNumber.replace(/\s/g, ""),
+          cvv,
+          month: Number.parseInt(month),
+          year: Number.parseInt(fullYear),
+          cardName,
+        }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        errors.push(result.error || "Stripe validation failed");
+        return { isValid: false, errors };
+      }
+
+      return {
+        isValid: true,
+        errors: [],
+        paymentMethod: result.paymentMethodId,
+      };
+    } catch (err) {
+      errors.push("Network error - unable to validate with Stripe");
+      return { isValid: false, errors };
+    }
+  };
+
+  const validateCardWithPayPal = async (
+    cardNumber: string,
+    cvv: string,
+    expiry: string,
+    cardName: string
+  ): Promise<{ isValid: boolean; errors: string[]; token?: string }> => {
+    const errors: string[] = [];
+
+    try {
+      const [month, year] = expiry.split("/");
+      const fullYear = `20${year}`;
+
+      const response = await fetch("/api/paypal-validate-card", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          cardNumber: cardNumber.replace(/\s/g, ""),
+          cvv,
+          expiryMonth: month,
+          expiryYear: fullYear,
+          cardName,
+        }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        errors.push(result.error || "PayPal validation failed");
+        return { isValid: false, errors };
+      }
+
+      return { isValid: true, errors: [], token: result.token };
+    } catch (err) {
+      errors.push("PayPal validation error");
+      return { isValid: false, errors };
+    }
+  };
+
+  const handleValidateCard = async () => {
+    if (paymentMethod === "stripe") {
+      const stripeValidation = await validateCardWithStripe();
+
+      if (!stripeValidation.isValid) {
+        showNotification(
+          "error",
+          "Card Validation Failed",
+          stripeValidation.errors.join(", ")
+        );
+        setResult(null);
+      } else {
+        const cardValidation = validateCardNumber(cardNumber);
+        showNotification(
+          "success",
+          "Card Validated Successfully",
+          `${cardValidation.cardType} card passed all validation checks including Luhn algorithm, CVV format, and expiry date validation`
+        );
+        setResult(stripeValidation.paymentMethod);
+      }
     } else {
-      showNotification(
-        "success",
-        "Validation Successful",
-        `${cardValidation.cardType} card ending in ${cardNumber.slice(
-          -4
-        )} with matching CVV and expiry is valid for transactions`
+      // PayPal validation using comprehensive form validation
+      const errors: string[] = [];
+
+      if (!cardName.trim()) {
+        errors.push("Cardholder name is required");
+      }
+
+      const cardValidation = validateCardNumber(cardNumber);
+      if (!cardValidation.isValid) {
+        errors.push(
+          `Invalid card number (failed Luhn algorithm check for ${cardValidation.cardType})`
+        );
+      }
+
+      if (!validateExpiryDate(expiryDate)) {
+        errors.push("Invalid or expired date");
+      }
+
+      if (!validateCVV(cvv, cardValidation.cardType)) {
+        errors.push(
+          `Invalid CVV (${
+            cardValidation.cardType === "Amex" ? "4" : "3"
+          } digits required for ${cardValidation.cardType})`
+        );
+      }
+
+      if (errors.length > 0) {
+        showNotification("error", "Validation Failed", errors.join(", "));
+        setResult(null);
+        return;
+      }
+
+      const paypalValidation = await validateCardWithPayPal(
+        cardNumber,
+        cvv,
+        expiryDate,
+        cardName
       );
-      setResult(null);
+
+      if (!paypalValidation.isValid) {
+        showNotification(
+          "error",
+          "Card Validation Failed",
+          paypalValidation.errors.join(", ")
+        );
+        setResult(null);
+      } else {
+        showNotification(
+          "success",
+          "Card Validated Successfully",
+          `${cardValidation.cardType} card passed all validation checks: Luhn algorithm ✓, Card type detection ✓, CVV format ✓, Expiry date ✓, Cardholder name ✓`
+        );
+        setResult({ token: paypalValidation.token });
+      }
+    }
+  };
+
+  const processStripePayment = async () => {
+    if (!stripe || !cardElement) {
+      showNotification(
+        "error",
+        "Stripe Error",
+        "Stripe not properly initialized"
+      );
+      return;
+    }
+
+    const stripeValidation = await validateCardWithStripe();
+
+    if (!stripeValidation.isValid) {
+      showNotification(
+        "error",
+        "Invalid Card",
+        stripeValidation.errors.join(", ")
+      );
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/create-payment-intent", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          amount: Math.round(Number.parseFloat(paymentAmount) * 100),
+          currency: "usd",
+          payment_method: stripeValidation.paymentMethod?.id,
+        }),
+      });
+
+      const { client_secret } = await response.json();
+
+      const { error: confirmError } = await stripe.confirmCardPayment(
+        client_secret,
+        {
+          payment_method: stripeValidation.paymentMethod?.id,
+        }
+      );
+
+      if (confirmError) {
+        showNotification(
+          "error",
+          "Payment Failed",
+          confirmError.message || "Payment could not be processed"
+        );
+      } else {
+        showNotification(
+          "success",
+          "Payment Successful",
+          `$${paymentAmount} charged successfully`
+        );
+        numberShuffleAndSelect();
+      }
+    } catch (error) {
+      showNotification("error", "Payment Error", "Unable to process payment");
+    }
+  };
+
+  const processPayPalPayment = async () => {
+    // First validate the card with PayPal
+    const paypalValidation = await validateCardWithPayPal(
+      cardNumber,
+      cvv,
+      expiryDate,
+      cardName
+    );
+
+    if (!paypalValidation.isValid) {
+      showNotification(
+        "error",
+        "Invalid Card",
+        paypalValidation.errors.join(", ")
+      );
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/paypal-process-payment", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          amount: paymentAmount,
+          currency: "USD",
+          cardToken: paypalValidation.token,
+        }),
+      });
+
+      const result = await response.json();
+
+      if (response.ok) {
+        showNotification(
+          "success",
+          "Payment Successful",
+          `$${paymentAmount} charged successfully via PayPal`
+        );
+        numberShuffleAndSelect();
+      } else {
+        showNotification(
+          "error",
+          "Payment Failed",
+          result.error || "Payment could not be processed"
+        );
+      }
+    } catch (error) {
+      showNotification(
+        "error",
+        "Payment Error",
+        "Unable to process PayPal payment"
+      );
     }
   };
 
@@ -434,10 +619,7 @@ export default function CombinedGeneratorApp() {
       }
 
       const script = document.createElement("script");
-      script.src = `https://www.paypal.com/sdk/js?client-id=${
-        process.env.NEXT_PUBLIC_PAYPAL_CLIENT_ID ||
-        "AeK2GE53XcONEKKRB33IFEW6sDmJrywHU_oBwWlW3EFpXvxqsE-y8DvMcGCtzA2RAB-1ovDRHgeIsSRR"
-      }&currency=USD`;
+      script.src = `https://www.paypal.com/sdk/js?client-id=AeK2GE53XcONEKKRB33IFEW6sDmJrywHU_oBwWlW3EFpXvxqsE-y8DvMcGCtzA2RAB-1ovDRHgeIsSRR&currency=USD`;
       script.async = true;
       script.onload = () => {
         console.log("[v0] PayPal SDK loaded successfully");
@@ -464,67 +646,15 @@ export default function CombinedGeneratorApp() {
         window.paypal
           .Buttons({
             createOrder: (data: any, actions: any) => {
-              const fundCheck = simulateFundCheck("paypal", paymentAmount);
-
-              if (fundCheck.hasFunds) {
-                // Simulate successful order creation
-                return Promise.resolve("SIMULATED_ORDER_ID_" + Date.now());
-              } else {
-                // Show insufficient funds notification and return a resolved promise
-                showNotification(
-                  "error",
-                  "❌ Insufficient Funds",
-                  fundCheck.message
-                );
-                // Return a resolved promise to prevent error handling
-                return Promise.resolve("INSUFFICIENT_FUNDS_" + Date.now());
-              }
+              return processPayPalPayment();
             },
             onApprove: async (data: any, actions: any) => {
-              try {
-                if (
-                  data.orderID &&
-                  data.orderID.startsWith("INSUFFICIENT_FUNDS_")
-                ) {
-                  // Don't process payment for insufficient funds
-                  return;
-                }
-
-                // Simulate fund checking for successful orders
-                const fundCheck = simulateFundCheck("paypal", paymentAmount);
-
-                if (fundCheck.hasFunds) {
-                  console.log("[v0] PayPal fund check successful (simulated)");
-                  showNotification(
-                    "success",
-                    "✅ Sufficient Funds",
-                    fundCheck.message
-                  );
-
-                  // Simulate payment completion
-                  setTimeout(() => {
-                    showNotification(
-                      "success",
-                      "Payment Simulation Complete",
-                      "This would process a real PayPal payment in live mode."
-                    );
-                    numberShuffleAndSelect();
-                  }, 1500);
-                } else {
-                  showNotification(
-                    "error",
-                    "❌ Insufficient Funds",
-                    fundCheck.message
-                  );
-                }
-              } catch (error: unknown) {
-                console.error("[v0] PayPal simulation error:", error);
-                showNotification(
-                  "error",
-                  "Payment Failed",
-                  "Fund checking simulation failed. Please try again."
-                );
-              }
+              showNotification(
+                "success",
+                "Payment Approved",
+                "PayPal payment completed successfully"
+              );
+              numberShuffleAndSelect();
             },
             onError: (err: unknown) => {
               console.error("[v0] PayPal unexpected error:", err);
@@ -568,6 +698,27 @@ export default function CombinedGeneratorApp() {
           "pk_test_51RxTA57QrmHcCFtzC1Ra136BPxrXN4lHW4rdbcsyhUJda2R3sxd3ViJjj4R93yb634VJfEUVS7IPCyW5uutGZmxL00HG2m5Jt8";
         const stripeInstance = window.Stripe(stripeKey);
         setStripe(stripeInstance);
+
+        // Create Elements instance
+        const elementsInstance = stripeInstance.elements();
+        setElements(elementsInstance);
+
+        // Create card element
+        const cardElementInstance = elementsInstance.create("card", {
+          style: {
+            base: {
+              fontSize: "18px",
+              fontFamily:
+                'ui-monospace, SFMono-Regular, "SF Mono", Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+              fontWeight: "600",
+              color: "#000000",
+              "::placeholder": {
+                color: "#6b7280",
+              },
+            },
+          },
+        });
+        setCardElement(cardElementInstance);
         setIsStripeLoaded(true);
       } else {
         setTimeout(initializeStripe, 100);
@@ -576,122 +727,14 @@ export default function CombinedGeneratorApp() {
     initializeStripe();
   }, []);
 
-  const simulateFundCheck = (
-    paymentMethod: "stripe" | "paypal",
-    amount: string
-  ): { hasFunds: boolean; message: string } => {
-    const numAmount = Number.parseFloat(amount);
-
-    if (paymentMethod === "stripe") {
-      // Simulate fund checking based on card number patterns
-      const cleanCardNumber = cardNumber.replace(/\s/g, "");
-
-      // Cards ending in even numbers have funds, odd numbers don't
-      const lastDigit = Number.parseInt(cleanCardNumber.slice(-1)) || 0;
-      const hasFunds = lastDigit % 2 === 0;
-
-      // Additional scenarios based on amount
-      if (numAmount > 1000) {
-        return {
-          hasFunds: false,
-          message: `Insufficient funds: Card has $${(
-            Math.random() * 800 +
-            100
-          ).toFixed(2)} available, but $${amount} requested.`,
-        };
-      }
-
-      if (hasFunds) {
-        const availableBalance = (
-          Math.random() * 2000 +
-          numAmount +
-          50
-        ).toFixed(2);
-        return {
-          hasFunds: true,
-          message: `Sufficient funds: Card has $${availableBalance} available for $${amount} transaction.`,
-        };
-      } else {
-        const availableBalance = (Math.random() * (numAmount - 1)).toFixed(2);
-        return {
-          hasFunds: false,
-          message: `Insufficient funds: Card has $${availableBalance} available, but $${amount} requested.`,
-        };
-      }
-    } else {
-      // PayPal fund simulation
-      const random = Math.random();
-
-      if (numAmount > 500) {
-        return {
-          hasFunds: false,
-          message: `PayPal account has insufficient funds: $${(
-            Math.random() * 400 +
-            50
-          ).toFixed(2)} available, but $${amount} requested.`,
-        };
-      }
-
-      if (random > 0.3) {
-        // 70% chance of having funds
-        const availableBalance = (
-          Math.random() * 1500 +
-          numAmount +
-          25
-        ).toFixed(2);
-        return {
-          hasFunds: true,
-          message: `PayPal account verified: $${availableBalance} available for $${amount} transaction.`,
-        };
-      } else {
-        const availableBalance = (Math.random() * (numAmount - 1)).toFixed(2);
-        return {
-          hasFunds: false,
-          message: `PayPal account has insufficient funds: $${availableBalance} available, but $${amount} requested.`,
-        };
+  useEffect(() => {
+    if (cardElement && paymentMethod === "stripe") {
+      const cardElementContainer = document.getElementById("card-element");
+      if (cardElementContainer && !cardElementContainer.hasChildNodes()) {
+        cardElement.mount("#card-element");
       }
     }
-  };
-
-  const processStripePayment = () => {
-    // Validate card details first
-    const cardValidation = validateCardNumber(cardNumber);
-    if (!cardValidation.isValid) {
-      showNotification(
-        "error",
-        "Invalid Card",
-        "Please enter a valid card number before checking funds."
-      );
-      return;
-    }
-
-    if (!cardName.trim()) {
-      showNotification(
-        "error",
-        "Missing Information",
-        "Please enter cardholder name before checking funds."
-      );
-      return;
-    }
-
-    // Simulate fund checking
-    const fundCheck = simulateFundCheck("stripe", paymentAmount);
-
-    if (fundCheck.hasFunds) {
-      showNotification("success", "✅ Sufficient Funds", fundCheck.message);
-      // Simulate successful payment flow
-      setTimeout(() => {
-        showNotification(
-          "success",
-          "Payment Simulation Complete",
-          "This would process a real payment in live mode."
-        );
-        numberShuffleAndSelect();
-      }, 1500);
-    } else {
-      showNotification("error", "❌ Insufficient Funds", fundCheck.message);
-    }
-  };
+  }, [cardElement, paymentMethod]);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-black via-gray-900 to-slate-900 font-sans">
@@ -723,71 +766,97 @@ export default function CombinedGeneratorApp() {
             </p>
           </CardHeader>
           <CardContent className="p-8">
-            <form onSubmit={handleSubmit} className="space-y-6">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div className="space-y-2">
-                  <label className="block text-sm font-sans font-bold text-gray-200 tracking-wide uppercase">
-                    Card Number
-                  </label>
-                  <Input
-                    type="text"
-                    value={cardNumber}
-                    onChange={(e) => setCardNumber(e.target.value)}
-                    placeholder="1234 5678 9012 3456"
-                    className="h-12 text-lg font-mono font-medium bg-white border-gray-400 text-black placeholder-gray-500 focus:border-black focus:ring-2 focus:ring-gray-300 tracking-wider"
-                  />
+            <div className="space-y-6">
+              <div className="space-y-6">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="space-y-2 group">
+                    <label className="block text-sm font-sans font-bold text-gray-200 tracking-wide uppercase transition-colors duration-300 group-focus-within:text-white">
+                      Card Number
+                    </label>
+                    <div className="relative">
+                      <Input
+                        type="text"
+                        value={cardNumber}
+                        onChange={(e) => setCardNumber(e.target.value)}
+                        placeholder="1234 5678 9012 3456"
+                        className="h-12 text-lg font-mono font-medium bg-white border-gray-400 text-black placeholder-gray-500 focus:border-black focus:ring-4 focus:ring-gray-300/50 tracking-wider transition-all duration-300 hover:shadow-lg hover:scale-[1.02] focus:scale-[1.02] focus:shadow-xl focus:bg-gray-50"
+                      />
+                      <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent opacity-0 focus-within:opacity-100 transition-opacity duration-500 pointer-events-none rounded-md"></div>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2 group">
+                    <label className="block text-sm font-sans font-bold text-gray-200 tracking-wide uppercase transition-colors duration-300 group-focus-within:text-white">
+                      Cardholder Name
+                    </label>
+                    <div className="relative">
+                      <Input
+                        type="text"
+                        value={cardName}
+                        onChange={(e) => setCardName(e.target.value)}
+                        placeholder="John Doe"
+                        className="h-12 text-lg font-sans font-medium bg-white border-gray-400 text-black placeholder-gray-500 focus:border-black focus:ring-4 focus:ring-gray-300/50 transition-all duration-300 hover:shadow-lg hover:scale-[1.02] focus:scale-[1.02] focus:shadow-xl focus:bg-gray-50"
+                      />
+                      <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent opacity-0 focus-within:opacity-100 transition-opacity duration-500 pointer-events-none rounded-md"></div>
+                    </div>
+                  </div>
                 </div>
 
-                <div className="space-y-2">
-                  <label className="block text-sm font-sans font-bold text-gray-200 tracking-wide uppercase">
-                    Cardholder Name
-                  </label>
-                  <Input
-                    type="text"
-                    value={cardName}
-                    onChange={(e) => setCardName(e.target.value)}
-                    placeholder="John Doe"
-                    className="h-12 text-lg font-sans font-medium bg-white border-gray-400 text-black placeholder-gray-500 focus:border-black focus:ring-2 focus:ring-gray-300"
-                  />
-                </div>
-              </div>
+                <div className="grid grid-cols-2 gap-6">
+                  <div className="space-y-2 group">
+                    <label className="block text-sm font-sans font-bold text-gray-200 tracking-wide uppercase transition-colors duration-300 group-focus-within:text-white">
+                      Expiry (MM/YY)
+                    </label>
+                    <div className="relative">
+                      <Input
+                        type="text"
+                        value={expiryDate}
+                        onChange={handleExpiryDateChange}
+                        placeholder="02/25"
+                        maxLength={5}
+                        className="h-12 text-xl font-mono font-bold bg-white border-gray-400 text-black placeholder-gray-500 focus:border-black focus:ring-4 focus:ring-gray-300/50 text-center tracking-widest transition-all duration-300 hover:shadow-lg hover:scale-[1.02] focus:scale-[1.02] focus:shadow-xl focus:bg-gray-50"
+                      />
+                      <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent opacity-0 focus-within:opacity-100 transition-opacity duration-500 pointer-events-none rounded-md"></div>
+                    </div>
+                  </div>
 
-              <div className="grid grid-cols-2 gap-6">
-                <div className="space-y-2">
-                  <label className="block text-sm font-sans font-bold text-gray-200 tracking-wide uppercase">
-                    Expiry (MM/YY)
-                  </label>
-                  <Input
-                    type="text"
-                    value={expiryDate}
-                    onChange={handleExpiryDateChange}
-                    placeholder="02/25"
-                    maxLength={5}
-                    className="h-12 text-xl font-mono font-bold bg-white border-gray-400 text-black placeholder-gray-500 focus:border-black focus:ring-2 focus:ring-gray-300 text-center tracking-widest"
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <label className="block text-sm font-sans font-bold text-gray-200 tracking-wide uppercase">
-                    CVV (GDP)
-                  </label>
-                  <Input
-                    type="text"
-                    value={cvv}
-                    onChange={(e) => setCvv(e.target.value)}
-                    placeholder="CVV"
-                    className="h-12 text-xl font-mono font-black bg-white border-gray-400 text-black placeholder-gray-500 focus:border-black focus:ring-2 focus:ring-gray-300 text-center tracking-widest"
-                  />
+                  <div className="space-y-2 group">
+                    <label className="block text-sm font-sans font-bold text-gray-200 tracking-wide uppercase transition-colors duration-300 group-focus-within:text-white">
+                      CVV (GDP)
+                    </label>
+                    <div className="relative">
+                      <Input
+                        type="text"
+                        value={cvv}
+                        onChange={(e) => setCvv(e.target.value)}
+                        placeholder="CVV"
+                        className="h-12 text-xl font-mono font-black bg-white border-gray-400 text-black placeholder-gray-500 focus:border-black focus:ring-4 focus:ring-gray-300/50 text-center tracking-widest transition-all duration-300 hover:shadow-lg hover:scale-[1.02] focus:scale-[1.02] focus:shadow-xl focus:bg-gray-50"
+                      />
+                      <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent opacity-0 focus-within:opacity-100 transition-opacity duration-500 pointer-events-none rounded-md"></div>
+                    </div>
+                  </div>
                 </div>
               </div>
 
               <Button
-                type="submit"
+                onClick={handleValidateCard}
                 className="w-full h-16 text-xl font-sans font-black bg-gradient-to-r from-black to-gray-800 hover:from-gray-800 hover:to-black text-white shadow-lg hover:shadow-xl transition-all duration-200 px-8 py-4 tracking-wide"
               >
                 🔍 <span className="font-mono">VALIDATE</span> CARD INFORMATION
               </Button>
-            </form>
+
+              <Button
+                onClick={
+                  paymentMethod === "stripe"
+                    ? processStripePayment
+                    : processPayPalPayment
+                }
+                className="w-full h-16 text-xl font-sans font-black bg-gradient-to-r from-black to-gray-800 hover:from-gray-800 hover:to-black text-white shadow-lg hover:shadow-xl transition-all duration-200 px-8 py-4 tracking-wide"
+              >
+                💳 PAY <span className="font-mono">${paymentAmount}</span> WITH
+                CARD
+              </Button>
+            </div>
 
             <div className="text-center mb-12 mt-8">
               <Button
